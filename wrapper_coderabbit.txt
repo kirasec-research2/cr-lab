@@ -1,0 +1,99 @@
+#!/usr/bin/env node
+import { spawn, spawnSync } from "node:child_process"
+
+const argv = process.argv.slice(2)
+const realCli = process.env.CODERABBIT_REAL_CLI_PATH || "/usr/local/bin/coderabbit"
+const nonReviewCommands = new Set(["auth", "doctor", "stats", "update"]);
+const isReview = !nonReviewCommands.has(argv[0] || "")
+const isAgentReview = isReview && argv.includes("--agent")
+let intentToAddPaths
+let pendingStdoutLine = ""
+let lastAgentOutputLine = ""
+
+function optionValue(...names) {
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]
+    if (names.includes(argument)) return argv[index + 1]
+    for (const name of names) {
+      if (argument.startsWith(name + "=")) return argument.slice(name.length + 1)
+    }
+  }
+}
+
+function includeUntrackedFiles() {
+  const reviewType = optionValue("-t", "--type") || "all"
+  if (!isReview || reviewType === "committed") return
+  const reviewCwd = optionValue("--cwd", "--dir") || process.cwd()
+  const listed = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+    cwd: reviewCwd,
+    encoding: "buffer",
+    maxBuffer: 16 * 1024 * 1024,
+  })
+  if (listed.status !== 0 || !listed.stdout?.length) return
+  const added = spawnSync("git", ["add", "--intent-to-add", "--pathspec-from-file=-", "--pathspec-file-nul"], {
+    cwd: reviewCwd,
+    input: listed.stdout,
+    stdio: ["pipe", "ignore", "pipe"],
+  })
+  if (added.status === 0) {
+    intentToAddPaths = { cwd: reviewCwd, paths: listed.stdout }
+    return
+  }
+  process.stderr.write("CodeRabbit could not include untracked files in this review; continuing with tracked changes.\n")
+}
+
+function restoreUntrackedFiles() {
+  if (!intentToAddPaths) return
+  const { cwd, paths } = intentToAddPaths
+  intentToAddPaths = undefined
+  const restored = spawnSync("git", ["reset", "--quiet", "--pathspec-from-file=-", "--pathspec-file-nul"], {
+    cwd,
+    input: paths,
+    stdio: ["pipe", "ignore", "pipe"],
+  })
+  if (restored.status !== 0) {
+    process.stderr.write("CodeRabbit reviewed untracked files but could not restore their untracked index state.\n")
+  }
+}
+
+process.on("exit", restoreUntrackedFiles)
+
+includeUntrackedFiles()
+const child = spawn(realCli, argv, { stdio: ["inherit", "pipe", "pipe"], env: process.env })
+let spawnFailed = false
+child.stdout.on("data", chunk => {
+  process.stdout.write(chunk)
+  if (!isAgentReview) return
+  pendingStdoutLine += chunk.toString("utf8")
+  for (;;) {
+    const newlineIndex = pendingStdoutLine.indexOf("\n")
+    if (newlineIndex < 0) break
+    const line = pendingStdoutLine.slice(0, newlineIndex).replace(/\r$/, "")
+    pendingStdoutLine = pendingStdoutLine.slice(newlineIndex + 1)
+    if (line.trim()) lastAgentOutputLine = line
+  }
+})
+child.stderr.on("data", chunk => process.stderr.write(chunk))
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.on(signal, () => { if (!child.killed) child.kill(signal) })
+}
+child.on("error", async error => {
+  spawnFailed = true
+  process.stderr.write((error instanceof Error ? error.message : String(error)) + "\n")
+  restoreUntrackedFiles()
+  process.exitCode = 127
+})
+child.on("close", async (code, signal) => {
+  if (spawnFailed) return
+  restoreUntrackedFiles()
+  if (isAgentReview) {
+    const trailingLine = pendingStdoutLine.replace(/\r$/, "")
+    if (trailingLine.trim()) lastAgentOutputLine = trailingLine
+    if (lastAgentOutputLine) {
+      // Repeat the final structured CLI record after process completion so
+      // the command tool's tail always contains the review outcome.
+      process.stdout.write(lastAgentOutputLine + "\n")
+    }
+  }
+  process.exitCode = typeof code === "number" ? code : signal ? 1 : 0
+})

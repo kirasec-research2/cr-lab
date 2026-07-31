@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+set -euo pipefail
+WRITE_POLICY="${KB_GIT_HISTORY_WRITE_POLICY:-allow}"
+GITHUB_WORKFLOW_AUTH="${CODERABBIT_GITHUB_WORKFLOW_AUTH:-}"
+GITHUB_WORKFLOW_AUTH_MARKER_PATH="${CODERABBIT_GITHUB_WORKFLOW_AUTH_MARKER_PATH:-}"
+GITHUB_WORKFLOW_AUTH_AVAILABLE_VALUE="available"
+GITHUB_WORKFLOW_PERMISSION_REQUIRED_SENTINEL="CODERABBIT_GITHUB_WORKFLOW_PERMISSION_REQUIRED"
+GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN="CODERABBIT_SANDBOX_SIGNAL_BEGIN"
+GITHUB_WORKFLOW_PERMISSION_SIGNAL_END="CODERABBIT_SANDBOX_SIGNAL_END"
+GITHUB_ACTOR_WRITE_CONNECT_REQUIRED="${CODERABBIT_GITHUB_ACTOR_WRITE_CONNECT_REQUIRED:-}"
+GITHUB_ACTOR_WRITE_CONNECT_REQUIRED_SENTINEL="CODERABBIT_GITHUB_ACTOR_WRITE_CONNECT_REQUIRED"
+GITHUB_ACTOR_WRITE_SCOPE_REQUIRED="${CODERABBIT_GITHUB_ACTOR_WRITE_SCOPE_REQUIRED:-}"
+GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH="${CODERABBIT_GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH:-}"
+GITHUB_ACTOR_WRITE_ALLOWED_REPOS_FILENAME="github-actor-write-allowed-repos"
+GITHUB_ACTOR_WRITE_OUT_OF_SCOPE_SENTINEL="CODERABBIT_GITHUB_ACTOR_WRITE_REPO_OUT_OF_SCOPE"
+canonicalize_executable() {
+  local target_path="$1"
+  local target_dir=""
+  target_dir="$(cd "$(dirname "$target_path")" && pwd -P)"
+  printf "%s/%s\n" "$target_dir" "$(basename "$target_path")"
+}
+SELF_PATH="$(canonicalize_executable "$0")"
+if [ -z "$GITHUB_WORKFLOW_AUTH_MARKER_PATH" ]; then
+  SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd -P)"
+  RUNTIME_ROOT_FROM_SELF="$(cd "$SELF_DIR/.." && pwd -P)"
+  GITHUB_WORKFLOW_AUTH_MARKER_PATH="$RUNTIME_ROOT_FROM_SELF/github-workflow-auth"
+fi
+if [ -z "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ]; then
+  SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd -P)"
+  RUNTIME_ROOT_FROM_SELF="$(cd "$SELF_DIR/.." && pwd -P)"
+  GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH="$RUNTIME_ROOT_FROM_SELF/$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_FILENAME"
+fi
+resolve_real_git() {
+  local candidate=""
+  local resolved_candidate=""
+  for candidate in /usr/bin/git /bin/git /usr/local/bin/git /opt/homebrew/bin/git; do
+    [ -x "$candidate" ] || continue
+    resolved_candidate="$(canonicalize_executable "$candidate")"
+    if [ "$resolved_candidate" != "$SELF_PATH" ]; then
+      printf "%s\n" "$resolved_candidate"
+      return 0
+    fi
+  done
+  candidate="$(env -u GIT_EXEC_PATH PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin sh -c 'command -v git 2>/dev/null' || true)"
+  if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+    resolved_candidate="$(canonicalize_executable "$candidate")"
+    if [ "$resolved_candidate" != "$SELF_PATH" ]; then
+      printf "%s\n" "$resolved_candidate"
+      return 0
+    fi
+  fi
+  return 1
+}
+resolve_subcommand() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+        if [ $# -lt 2 ]; then printf "\\n"; return 0; fi
+        shift 2
+        ;;
+      --exec-path=*|--git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--list-cmds=*)
+        shift
+        ;;
+      --exec-path|--paginate|--no-pager|--no-optional-locks|--literal-pathspecs|--no-literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects|--bare)
+        shift
+        ;;
+      --)
+        shift
+        if [ $# -gt 0 ]; then printf "%s\n" "$1"; else printf "\n"; fi
+        return 0
+        ;;
+      -*)
+        shift
+        ;;
+      *)
+        printf "%s\n" "$1"
+        return 0
+        ;;
+    esac
+  done
+  printf "\n"
+}
+resolve_git_effective_cwd() {
+  local git_cwd="$PWD"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C)
+        if [ $# -lt 2 ]; then break; fi
+        shift
+        case "$1" in
+          /*) git_cwd="$1" ;;
+          *) git_cwd="$git_cwd/$1" ;;
+        esac
+        shift
+        ;;
+      -c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+        if [ $# -lt 2 ]; then break; fi
+        shift 2
+        ;;
+      --exec-path=*|--git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--list-cmds=*)
+        shift
+        ;;
+      --exec-path|--paginate|--no-pager|--no-optional-locks|--literal-pathspecs|--no-literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects|--bare)
+        shift
+        ;;
+      --)
+        break
+        ;;
+      -*)
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  (cd "$git_cwd" 2>/dev/null && pwd -P) || printf "%s\n" "$git_cwd"
+}
+run_git_in_effective_cwd() {
+  local git_cwd="$1"
+  shift
+  "$REAL_GIT_PATH" -C "$git_cwd" "$@"
+}
+has_github_workflow_auth() {
+  if [ "$GITHUB_WORKFLOW_AUTH" = "$GITHUB_WORKFLOW_AUTH_AVAILABLE_VALUE" ]; then
+    return 0
+  fi
+  if [ -n "$GITHUB_WORKFLOW_AUTH_MARKER_PATH" ] && [ -f "$GITHUB_WORKFLOW_AUTH_MARKER_PATH" ]; then
+    local marker_value=""
+    marker_value="$(tr -d "[:space:]" < "$GITHUB_WORKFLOW_AUTH_MARKER_PATH" 2>/dev/null || true)"
+    [ "$marker_value" = "$GITHUB_WORKFLOW_AUTH_AVAILABLE_VALUE" ] && return 0
+  fi
+  return 1
+}
+is_github_remote_url() {
+  local value="$1"
+  case "$value" in
+    http://github.com/*|https://github.com/*|http://github.com:*/*|https://github.com:*/*|http://*@github.com/*|https://*@github.com/*|http://*@github.com:*/*|https://*@github.com:*/*|git://github.com/*|ssh://github.com/*|ssh://github.com:*/*|ssh://*@github.com/*|ssh://*@github.com:*/*|*@github.com:*|github.com:*|github.com/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+github_remote_url_has_http_credentials() {
+  local value="$1"
+  case "$value" in
+    http://*@github.com/*|https://*@github.com/*|http://*@github.com:*/*|https://*@github.com:*/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+github_remote_url_uses_http_transport() {
+  local value="$1"
+  case "$value" in
+    http://github.com/*|https://github.com/*|http://github.com:*/*|https://github.com:*/*|http://*@github.com/*|https://*@github.com/*|http://*@github.com:*/*|https://*@github.com:*/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+ensure_github_actor_push_uses_brokered_https() {
+  local remote_url="$1"
+  if github_remote_url_has_http_credentials "$remote_url"; then
+    printf "%s\n" "CodeRabbit blocked this GitHub push because the remote URL contains embedded credentials. Pushes for connected GitHub users must use the approved GitHub OAuth token broker." >&2
+    exit 89
+  fi
+  if ! github_remote_url_uses_http_transport "$remote_url"; then
+    printf "%s\n" "CodeRabbit blocked this GitHub push because pushes for connected GitHub users must use HTTPS so the approved GitHub OAuth token can be brokered." >&2
+    exit 89
+  fi
+}
+normalize_github_remote_repo_path() {
+  local value="$1"
+  local path_part=""
+  case "$value" in
+    http://github.com/*) path_part="${value#http://github.com/}" ;;
+    https://github.com/*) path_part="${value#https://github.com/}" ;;
+    http://github.com:*/*) path_part="${value#http://github.com:}"; path_part="${path_part#*/}" ;;
+    https://github.com:*/*) path_part="${value#https://github.com:}"; path_part="${path_part#*/}" ;;
+    http://*@github.com/*) path_part="${value#http://*@github.com/}" ;;
+    https://*@github.com/*) path_part="${value#https://*@github.com/}" ;;
+    http://*@github.com:*/*) path_part="${value#http://*@github.com:}"; path_part="${path_part#*/}" ;;
+    https://*@github.com:*/*) path_part="${value#https://*@github.com:}"; path_part="${path_part#*/}" ;;
+    git://github.com/*) path_part="${value#git://github.com/}" ;;
+    ssh://*@github.com:*/*) path_part="${value#ssh://*@github.com:}"; path_part="${path_part#*/}" ;;
+    ssh://github.com:*/*) path_part="${value#ssh://github.com:}"; path_part="${path_part#*/}" ;;
+    ssh://*@github.com/*) path_part="${value#ssh://*@github.com/}" ;;
+    ssh://github.com/*) path_part="${value#ssh://github.com/}" ;;
+    *@github.com:*) path_part="${value#*@github.com:}" ;;
+    github.com:*) path_part="${value#github.com:}" ;;
+    github.com/*) path_part="${value#github.com/}" ;;
+    *) return 1 ;;
+  esac
+  path_part="${path_part%%\?*}"
+  path_part="${path_part%%#*}"
+  path_part="${path_part#/}"
+  path_part="${path_part%/}"
+  path_part="${path_part%.git}"
+  local owner="${path_part%%/*}"
+  local rest="${path_part#*/}"
+  local repo="${rest%%/*}"
+  if [ -z "$owner" ] || [ -z "$repo" ] || [ "$rest" = "$path_part" ]; then return 1; fi
+  printf "%s/%s\n" "$owner" "$repo" | tr "[:upper:]" "[:lower:]"
+}
+github_actor_write_repo_in_scope() {
+  local repo_path="$1"
+  [ -n "$repo_path" ] || return 1
+  [ -f "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ] || return 1
+  grep -Fxq "$repo_path" "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH"
+}
+github_actor_write_scope_is_required() {
+  [ "$GITHUB_ACTOR_WRITE_SCOPE_REQUIRED" = "1" ] && return 0
+  [ -f "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ] && return 0
+  return 1
+}
+push_ref_changed_workflow_files() {
+  local git_cwd="$1"
+  local remote_name="$2"
+  local refspec="$3"
+  local current_branch="$4"
+  local local_ref="$refspec"
+  local remote_ref=""
+  local remote_branch=""
+  local local_oid=""
+  local base_oid=""
+  local candidate=""
+  local changed=""
+  local_ref="${local_ref#+}"
+  case "$local_ref" in
+    :*) return 1 ;;
+  esac
+  if [ "$local_ref" != "${local_ref#*:}" ]; then
+    remote_ref="${local_ref#*:}"
+    local_ref="${local_ref%%:*}"
+  fi
+  [ -n "$local_ref" ] || return 1
+  local_oid="$(run_git_in_effective_cwd "$git_cwd" rev-parse --verify "$local_ref^{commit}" 2>/dev/null || true)"
+  [ -n "$local_oid" ] || return 1
+  if [ -n "$remote_ref" ]; then
+    remote_branch="${remote_ref#refs/heads/}"
+  elif [ "$local_ref" = "HEAD" ]; then
+    remote_branch="$current_branch"
+  else
+    remote_branch="${local_ref#refs/heads/}"
+  fi
+  for candidate in "refs/remotes/$remote_name/$remote_branch" "$remote_name/$remote_branch" "refs/remotes/$remote_name/HEAD" "refs/remotes/$remote_name/main" "refs/remotes/$remote_name/master"; do
+    [ -n "$candidate" ] || continue
+    base_oid="$(run_git_in_effective_cwd "$git_cwd" rev-parse --verify "$candidate^{commit}" 2>/dev/null || true)"
+    [ -n "$base_oid" ] && break
+  done
+  if [ -n "$base_oid" ]; then
+    changed="$(run_git_in_effective_cwd "$git_cwd" diff --name-only "$base_oid" "$local_oid" -- .github/workflows 2>/dev/null || true)"
+  else
+    changed="$(run_git_in_effective_cwd "$git_cwd" diff-tree --no-commit-id --name-only -r "$local_oid" -- .github/workflows 2>/dev/null || true)"
+  fi
+  [ -n "$changed" ]
+}
+check_github_workflow_push() {
+  has_github_workflow_auth && return 0
+  local git_cwd=""
+  local remote_name=""
+  local remote_url=""
+  local current_branch=""
+  local delete_mode="0"
+  local full_push="0"
+  local -a refspecs=()
+  git_cwd="$(resolve_git_effective_cwd "$@")"
+  while [ $# -gt 0 ]; do
+    local arg="$1"
+    case "$arg" in
+      push)
+        shift
+        break
+        ;;
+      -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+        if [ $# -lt 2 ]; then return 0; fi
+        shift 2
+        ;;
+      --exec-path=*|--git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--list-cmds=*)
+        shift
+        ;;
+      --exec-path|--paginate|--no-pager|--no-optional-locks|--literal-pathspecs|--no-literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-replace-objects|--bare)
+        shift
+        ;;
+      --)
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  while [ $# -gt 0 ]; do
+    local arg="$1"
+    case "$arg" in
+      --)
+        shift
+        break
+        ;;
+      --delete)
+        delete_mode="1"
+        shift
+        ;;
+      --repo|-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--receive-pack|--exec|--push-option|-o)
+        if [ $# -lt 2 ]; then return 0; fi
+        shift 2
+        ;;
+      --repo=*|--receive-pack=*|--exec=*|--push-option=*|--force-with-lease=*|--recurse-submodules=*|--signed=*)
+        shift
+        ;;
+      --all|--mirror|--tags)
+        full_push="1"
+        shift
+        ;;
+      --dry-run|--porcelain|--force|--set-upstream|-u|--prune|--no-verify|--follow-tags|--atomic|--verbose|-v|-q|--quiet)
+        shift
+        ;;
+      -*)
+        shift
+        ;;
+      *)
+        if [ -z "$remote_name" ]; then
+          remote_name="$arg"
+        else
+          refspecs+=("$arg")
+        fi
+        shift
+        ;;
+    esac
+  done
+  while [ $# -gt 0 ]; do
+    if [ -z "$remote_name" ]; then remote_name="$1"; else refspecs+=("$1"); fi
+    shift
+  done
+  [ "$delete_mode" = "1" ] && return 0
+  current_branch="$(run_git_in_effective_cwd "$git_cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -z "$remote_name" ]; then
+    remote_name="$(run_git_in_effective_cwd "$git_cwd" config --get "branch.$current_branch.remote" 2>/dev/null || true)"
+    [ -n "$remote_name" ] || remote_name="origin"
+  fi
+  remote_url="$(run_git_in_effective_cwd "$git_cwd" config --get "remote.$remote_name.url" 2>/dev/null || true)"
+  [ -n "$remote_url" ] || remote_url="$remote_name"
+  is_github_remote_url "$remote_url" || return 0
+  if [ "$full_push" = "1" ]; then
+    printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+    printf "%s\n" '{"source":"git_push_guard","workflowPermissionRequired":true}' >&2
+    printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+    printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_REQUIRED_SENTINEL" >&2
+    printf "%s\n" "This push publishes multiple Git refs to GitHub, which may include workflow files and requires GitHub workflow permission." >&2
+    printf "%s\n" "Ask the Slack user to connect GitHub with workflow_control, then retry the push." >&2
+    exit 87
+  fi
+  if [ "${#refspecs[@]}" -eq 0 ]; then
+    [ -n "$current_branch" ] || return 0
+    refspecs=("$current_branch")
+  fi
+  local refspec=""
+  for refspec in "${refspecs[@]}"; do
+    if push_ref_changed_workflow_files "$git_cwd" "$remote_name" "$refspec" "$current_branch"; then
+      printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+      printf "%s\n" '{"source":"git_push_guard","workflowPermissionRequired":true}' >&2
+      printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+      printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_REQUIRED_SENTINEL" >&2
+      printf "%s\n" "This push changes files under .github/workflows, which requires GitHub workflow permission." >&2
+      printf "%s\n" "Ask the Slack user to connect GitHub with workflow_control, then retry the push." >&2
+      exit 87
+    fi
+  done
+}
+emit_github_actor_write_connect_signal() {
+  local action="$1"
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+  printf "%s\n" '{"source":"git_actor_write_guard","repoWriteConnectRequired":true}' >&2
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+  printf "%s\n" "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED_SENTINEL" >&2
+  printf "%s\n" "GitHub $action requires connecting your GitHub account, because commits, pushes, and pull requests for this run are made as you, not the bot." >&2
+  printf "%s\n" "Connect GitHub, then the write runs as you." >&2
+  exit 87
+}
+emit_github_actor_write_out_of_scope_signal() {
+  local action="$1"
+  local repo_path="$2"
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+  printf '{"source":"git_actor_write_guard","repoWriteOutOfScope":true' >&2
+  if [ -n "$repo_path" ]; then printf ',"repo":"%s"' "$repo_path" >&2; fi
+  printf "%s\n" "}" >&2
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+  printf "%s\n" "$GITHUB_ACTOR_WRITE_OUT_OF_SCOPE_SENTINEL" >&2
+  if [ -n "$repo_path" ]; then
+    printf "%s\n" "GitHub $action is blocked because $repo_path is not in this Discord server's CodeRabbit repo scope." >&2
+  else
+    printf "%s\n" "GitHub $action is blocked because this repo is not in this Discord server's CodeRabbit repo scope." >&2
+  fi
+  printf "%s\n" "Ask a server owner or CodeRabbit workspace admin to add the repo to the Discord scope, then try again." >&2
+  exit 88
+}
+check_github_actor_write_scope() {
+  github_actor_write_scope_is_required || return 0
+  local action="$1"
+  local remote_url="$2"
+  local repo_path=""
+  repo_path="$(normalize_github_remote_repo_path "$remote_url" 2>/dev/null || true)"
+  github_actor_write_repo_in_scope "$repo_path" && return 0
+  emit_github_actor_write_out_of_scope_signal "$action" "$repo_path"
+}
+current_repo_github_remote_url() {
+  local git_cwd="$1"
+  local current_branch=""
+  local branch_remote=""
+  local remote_name=""
+  local remote_url=""
+  current_branch="$(run_git_in_effective_cwd "$git_cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$current_branch" ]; then
+    branch_remote="$(run_git_in_effective_cwd "$git_cwd" config --get "branch.$current_branch.remote" 2>/dev/null || true)"
+  fi
+  for remote_name in "$branch_remote" origin $(run_git_in_effective_cwd "$git_cwd" remote 2>/dev/null || true); do
+    [ -n "$remote_name" ] || continue
+    remote_url="$(run_git_in_effective_cwd "$git_cwd" config --get "remote.$remote_name.url" 2>/dev/null || true)"
+    [ -n "$remote_url" ] || remote_url="$remote_name"
+    if is_github_remote_url "$remote_url"; then printf "%s\n" "$remote_url"; return 0; fi
+  done
+  return 1
+}
+github_push_remote_url_from_args() {
+  local git_cwd="$1"
+  shift || true
+  local remote_name=""
+  local remote_url=""
+  local current_branch=""
+  while [ $# -gt 0 ]; do
+    local arg="$1"
+    case "$arg" in
+      push)
+        shift
+        break
+        ;;
+      -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env)
+        if [ $# -lt 2 ]; then return 1; fi
+        shift 2
+        ;;
+      --exec-path=*|--git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*|--config-env=*|--list-cmds=*)
+        shift
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --) shift ;;
+      --repo|-C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env|--receive-pack|--exec|--push-option|-o)
+        if [ $# -lt 2 ]; then return 1; fi
+        shift 2
+        ;;
+      --repo=*|--receive-pack=*|--exec=*|--push-option=*|--force-with-lease=*|--recurse-submodules=*|--signed=*)
+        shift
+        ;;
+      --dry-run|--porcelain|--force|--set-upstream|-u|--prune|--no-verify|--follow-tags|--atomic|--verbose|-v|-q|--quiet|--delete|--all|--mirror|--tags)
+        shift
+        ;;
+      -*) shift ;;
+      *) if [ -z "$remote_name" ]; then remote_name="$1"; fi; shift ;;
+    esac
+  done
+  current_branch="$(run_git_in_effective_cwd "$git_cwd" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -z "$remote_name" ]; then
+    remote_name="$(run_git_in_effective_cwd "$git_cwd" config --get "branch.$current_branch.remote" 2>/dev/null || true)"
+    [ -n "$remote_name" ] || remote_name="origin"
+  fi
+  remote_url="$(run_git_in_effective_cwd "$git_cwd" config --get "remote.$remote_name.url" 2>/dev/null || true)"
+  [ -n "$remote_url" ] || remote_url="$remote_name"
+  is_github_remote_url "$remote_url" || return 1
+  printf "%s\n" "$remote_url"
+}
+check_github_actor_push_scope() {
+  github_actor_write_scope_is_required || return 0
+  local git_cwd=""
+  local remote_url=""
+  git_cwd="$(resolve_git_effective_cwd "$@")"
+  remote_url="$(github_push_remote_url_from_args "$git_cwd" "$@" || true)"
+  [ -n "$remote_url" ] || return 0
+  check_github_actor_write_scope "push" "$remote_url"
+}
+check_github_actor_write() {
+  if [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" != "1" ] && ! github_actor_write_scope_is_required; then return 0; fi
+  local subcommand="$1"
+  local git_cwd=""
+  local repo_remote_url=""
+  shift || true
+  git_cwd="$(resolve_git_effective_cwd "$@")"
+  case "$subcommand" in
+    commit|merge|rebase|cherry-pick|revert|am)
+      repo_remote_url="$(current_repo_github_remote_url "$git_cwd" || true)"
+      [ -n "$repo_remote_url" ] || return 0
+      check_github_actor_write_scope "$subcommand" "$repo_remote_url"
+      [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" = "1" ] && emit_github_actor_write_connect_signal "$subcommand"
+      return 0
+      ;;
+    push)
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  repo_remote_url="$(github_push_remote_url_from_args "$git_cwd" "$@" || true)"
+  [ -n "$repo_remote_url" ] || return 0
+  check_github_actor_write_scope "push" "$repo_remote_url"
+  ensure_github_actor_push_uses_brokered_https "$repo_remote_url"
+  [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" = "1" ] && emit_github_actor_write_connect_signal "push"
+  return 0
+}
+exec_real_git() {
+  if [ "$SUBCOMMAND" = "push" ] && { [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" = "1" ] || github_actor_write_scope_is_required; }; then
+    local git_cwd=""
+    local remote_url=""
+    git_cwd="$(resolve_git_effective_cwd "$@")"
+    remote_url="$(github_push_remote_url_from_args "$git_cwd" "$@" || true)"
+    if [ -n "$remote_url" ]; then
+      exec "$REAL_GIT_PATH" -c credential.helper= -c "credential.https://github.com.helper=" -c "credential.http://github.com.helper=" "$@"
+    fi
+  fi
+  exec "$REAL_GIT_PATH" "$@"
+}
+REAL_GIT_PATH="$(resolve_real_git || true)"
+if [ -z "$REAL_GIT_PATH" ]; then
+  echo "KB git history guard could not locate the real git binary." >&2
+  exit 127
+fi
+SUBCOMMAND="$(resolve_subcommand "$@")"
+if [ "$WRITE_POLICY" = "deny" ]; then
+  case "$SUBCOMMAND" in
+    commit|push|pull|merge|rebase|am|cherry-pick|revert|reset|switch|checkout|branch)
+      printf 'KB runtime guard blocked `git %s` in runtime-managed mode.\n' "$SUBCOMMAND" >&2
+      printf '%s\n' 'Prepare valid KB edits and staged changes only; leave commits, pushes, and HEAD rewrites to the runtime.' >&2
+      exit 86
+      ;;
+  esac
+fi
+if [ "$SUBCOMMAND" = "push" ]; then
+  check_github_actor_push_scope "$@"
+  check_github_workflow_push "$@"
+fi
+case "$SUBCOMMAND" in
+  commit|merge|rebase|cherry-pick|revert|am|push)
+    check_github_actor_write "$SUBCOMMAND" "$@"
+    ;;
+esac
+exec_real_git "$@"

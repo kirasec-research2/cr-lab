@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+set -euo pipefail
+GITHUB_ACTOR_WRITE_CONNECT_REQUIRED="${CODERABBIT_GITHUB_ACTOR_WRITE_CONNECT_REQUIRED:-}"
+GITHUB_ACTOR_WRITE_CONNECT_REQUIRED_SENTINEL="CODERABBIT_GITHUB_ACTOR_WRITE_CONNECT_REQUIRED"
+GITHUB_ACTOR_WRITE_SCOPE_REQUIRED="${CODERABBIT_GITHUB_ACTOR_WRITE_SCOPE_REQUIRED:-}"
+GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH="${CODERABBIT_GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH:-}"
+GITHUB_ACTOR_WRITE_ALLOWED_REPOS_FILENAME="github-actor-write-allowed-repos"
+GITHUB_ACTOR_WRITE_OUT_OF_SCOPE_SENTINEL="CODERABBIT_GITHUB_ACTOR_WRITE_REPO_OUT_OF_SCOPE"
+GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN="CODERABBIT_SANDBOX_SIGNAL_BEGIN"
+GITHUB_WORKFLOW_PERMISSION_SIGNAL_END="CODERABBIT_SANDBOX_SIGNAL_END"
+canonicalize_executable() {
+  local target_path="$1"
+  local target_dir=""
+  target_dir="$(cd "$(dirname "$target_path")" && pwd -P)"
+  printf "%s/%s\n" "$target_dir" "$(basename "$target_path")"
+}
+SELF_PATH="$(canonicalize_executable "$0")"
+if [ -z "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ]; then
+  SELF_DIR="$(cd "$(dirname "$SELF_PATH")" && pwd -P)"
+  RUNTIME_ROOT_FROM_SELF="$(cd "$SELF_DIR/.." && pwd -P)"
+  GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH="$RUNTIME_ROOT_FROM_SELF/$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_FILENAME"
+fi
+resolve_real_gh() {
+  local candidate=""
+  local resolved_candidate=""
+  if [ -n "${CODERABBIT_REAL_GH_PATH:-}" ] && [ -x "$CODERABBIT_REAL_GH_PATH" ]; then
+    resolved_candidate="$(canonicalize_executable "$CODERABBIT_REAL_GH_PATH")"
+    if [ "$resolved_candidate" != "$SELF_PATH" ]; then printf "%s\n" "$resolved_candidate"; return 0; fi
+  fi
+  for candidate in /usr/bin/gh /bin/gh /usr/local/bin/gh /opt/homebrew/bin/gh; do
+    [ -x "$candidate" ] || continue
+    resolved_candidate="$(canonicalize_executable "$candidate")"
+    if [ "$resolved_candidate" != "$SELF_PATH" ]; then printf "%s\n" "$resolved_candidate"; return 0; fi
+  done
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    resolved_candidate="$(canonicalize_executable "$candidate")"
+    if [ "$resolved_candidate" != "$SELF_PATH" ]; then printf "%s\n" "$resolved_candidate"; return 0; fi
+  done < <(bash -c "type -P -a gh 2>/dev/null" || true)
+  return 1
+}
+normalize_github_repo_path() {
+  local value="$1"
+  local path_part=""
+  case "$value" in
+    http://github.com/*) path_part="${value#http://github.com/}" ;;
+    https://github.com/*) path_part="${value#https://github.com/}" ;;
+    https://api.github.com/repos/*) path_part="${value#https://api.github.com/repos/}" ;;
+    git://github.com/*) path_part="${value#git://github.com/}" ;;
+    ssh://*@github.com:*/*) path_part="${value#ssh://*@github.com:}"; path_part="${path_part#*/}" ;;
+    ssh://github.com:*/*) path_part="${value#ssh://github.com:}"; path_part="${path_part#*/}" ;;
+    ssh://*@github.com/*) path_part="${value#ssh://*@github.com/}" ;;
+    ssh://github.com/*) path_part="${value#ssh://github.com/}" ;;
+    *@github.com:*) path_part="${value#*@github.com:}" ;;
+    github.com:*) path_part="${value#github.com:}" ;;
+    github.com/*) path_part="${value#github.com/}" ;;
+    /repos/*/*) path_part="${value#/repos/}" ;;
+    repos/*/*) path_part="${value#repos/}" ;;
+    *) path_part="$value" ;;
+  esac
+  path_part="${path_part%%\?*}"
+  path_part="${path_part%%#*}"
+  path_part="${path_part#/}"
+  path_part="${path_part%/}"
+  path_part="${path_part%.git}"
+  local owner="${path_part%%/*}"
+  local rest="${path_part#*/}"
+  local repo="${rest%%/*}"
+  if [ -z "$owner" ] || [ -z "$repo" ] || [ "$rest" = "$path_part" ]; then return 1; fi
+  printf "%s/%s\n" "$owner" "$repo" | tr "[:upper:]" "[:lower:]"
+}
+github_actor_write_scope_is_required() {
+  [ "$GITHUB_ACTOR_WRITE_SCOPE_REQUIRED" = "1" ] && return 0
+  [ -f "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ] && return 0
+  return 1
+}
+github_actor_write_repo_in_scope() {
+  local repo_path="$1"
+  [ -n "$repo_path" ] || return 1
+  [ -f "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH" ] || return 1
+  grep -Fxq "$repo_path" "$GITHUB_ACTOR_WRITE_ALLOWED_REPOS_PATH"
+}
+emit_github_actor_write_connect_signal() {
+  local action="$1"
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+  printf "%s\n" '{"source":"gh_actor_write_guard","repoWriteConnectRequired":true}' >&2
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+  printf "%s\n" "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED_SENTINEL" >&2
+  printf "%s\n" "GitHub $action requires connecting your GitHub account, because commits, pushes, and pull requests for this run are made as you, not the bot." >&2
+  printf "%s\n" "Connect GitHub, then the write runs as you." >&2
+  exit 87
+}
+emit_github_actor_write_out_of_scope_signal() {
+  local action="$1"
+  local repo_path="$2"
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_BEGIN" >&2
+  printf '{"source":"gh_actor_write_guard","repoWriteOutOfScope":true' >&2
+  if [ -n "$repo_path" ]; then printf ',"repo":"%s"' "$repo_path" >&2; fi
+  printf "%s\n" "}" >&2
+  printf "%s\n" "$GITHUB_WORKFLOW_PERMISSION_SIGNAL_END" >&2
+  printf "%s\n" "$GITHUB_ACTOR_WRITE_OUT_OF_SCOPE_SENTINEL" >&2
+  if [ -n "$repo_path" ]; then
+    printf "%s\n" "GitHub $action is blocked because $repo_path is not in this Discord server's CodeRabbit repo scope." >&2
+  else
+    printf "%s\n" "GitHub $action is blocked because this repo is not in this Discord server's CodeRabbit repo scope." >&2
+  fi
+  printf "%s\n" "Ask a server owner or CodeRabbit workspace admin to add the repo to the Discord scope, then try again." >&2
+  exit 88
+}
+exec_github_actor_pr_create_rest() {
+  local repo_path="$1"
+  shift
+  local title=""
+  local body=""
+  local base=""
+  local head=""
+  local draft="0"
+  shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo)
+        if [ $# -lt 2 ]; then break; fi
+        shift 2
+        ;;
+      --repo=*) shift ;;
+      --title|-t)
+        if [ $# -lt 2 ]; then break; fi
+        title="$2"
+        shift 2
+        ;;
+      --title=*)
+        title="${1#--title=}"
+        shift
+        ;;
+      --body|-b)
+        if [ $# -lt 2 ]; then break; fi
+        body="$2"
+        shift 2
+        ;;
+      --body=*)
+        body="${1#--body=}"
+        shift
+        ;;
+      --body-file|-F)
+        if [ $# -lt 2 ]; then break; fi
+        body="$(cat "$2" 2>/dev/null || true)"
+        shift 2
+        ;;
+      --body-file=*)
+        body="$(cat "${1#--body-file=}" 2>/dev/null || true)"
+        shift
+        ;;
+      --base|-B)
+        if [ $# -lt 2 ]; then break; fi
+        base="$2"
+        shift 2
+        ;;
+      --base=*)
+        base="${1#--base=}"
+        shift
+        ;;
+      --head|-H)
+        if [ $# -lt 2 ]; then break; fi
+        head="$2"
+        shift 2
+        ;;
+      --head=*)
+        head="${1#--head=}"
+        shift
+        ;;
+      --draft)
+        draft="1"
+        shift
+        ;;
+      --fill|--fill-first|--fill-verbose|--no-maintainer-edit)
+        shift
+        ;;
+      --assignee|--label|--milestone|--project|--reviewer|--recover|--template)
+        if [ $# -lt 2 ]; then break; fi
+        shift 2
+        ;;
+      --assignee=*|--label=*|--milestone=*|--project=*|--reviewer=*|--recover=*|--template=*) shift ;;
+      --web|--editor)
+        shift
+        ;;
+      --)
+        shift
+        break
+        ;;
+      *) shift ;;
+    esac
+  done
+  [ -n "$head" ] || head="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  [ -n "$head" ] || head="$(git rev-parse --quiet --short HEAD 2>/dev/null || true)"
+  [ -n "$base" ] || base="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed "s#^origin/##" || true)"
+  [ -n "$base" ] || base="main"
+  [ -n "$title" ] || title="$(git log -1 --pretty=%s 2>/dev/null || true)"
+  [ -n "$title" ] || title="$head"
+  local payload_file=""
+  local response_file=""
+  local status=""
+  payload_file="$(mktemp)"
+  response_file="$(mktemp)"
+  TITLE="$title" BODY="$body" HEAD_REF="$head" BASE_REF="$base" DRAFT="$draft" node --input-type=module >"$payload_file" <<'NODE'
+const payload = {
+  title: process.env.TITLE ?? '',
+  head: process.env.HEAD_REF ?? '',
+  base: process.env.BASE_REF ?? '',
+  body: process.env.BODY ?? '',
+}
+if (process.env.DRAFT === '1') payload.draft = true
+process.stdout.write(JSON.stringify(payload))
+NODE
+  status="$(curl --silent --show-error --location --output "$response_file" --write-out "%{http_code}" --request POST --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --header "Content-Type: application/json" --data-binary "@$payload_file" "https://api.github.com/repos/$repo_path/pulls")" || {
+    local curl_status="$?"
+    rm -f "$payload_file" "$response_file"
+    exit "$curl_status"
+  }
+  rm -f "$payload_file"
+  if [ "$status" != "201" ]; then
+    cat "$response_file" >&2 2>/dev/null || true
+    rm -f "$response_file"
+    exit 1
+  fi
+  node --input-type=module - "$response_file" <<'NODE'
+import { readFileSync } from 'node:fs'
+const responsePath = process.argv[2]
+const payload = JSON.parse(readFileSync(responsePath, 'utf8'))
+if (typeof payload.html_url !== 'string' || payload.html_url.length === 0) {
+  throw new Error('GitHub PR create response did not include html_url')
+}
+process.stdout.write(payload.html_url + '\n')
+NODE
+  rm -f "$response_file"
+  exit 0
+}
+resolve_gh_command() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo|--hostname|--config-dir)
+        if [ $# -lt 2 ]; then printf "\n"; return 0; fi
+        shift 2
+        ;;
+      --repo=*|--hostname=*|--config-dir=*) shift ;;
+      --) shift; if [ $# -gt 0 ]; then printf "%s\n" "$1"; else printf "\n"; fi; return 0 ;;
+      -*) shift ;;
+      *) printf "%s\n" "$1"; return 0 ;;
+    esac
+  done
+  printf "\n"
+}
+resolve_gh_subcommand() {
+  local command="$1"
+  shift || true
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$command" ]; then shift; break; fi
+    shift
+  done
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo|--hostname|--config-dir)
+        if [ $# -lt 2 ]; then printf "\n"; return 0; fi
+        shift 2
+        ;;
+      --repo=*|--hostname=*|--config-dir=*) shift ;;
+      --) shift; if [ $# -gt 0 ]; then printf "%s\n" "$1"; else printf "\n"; fi; return 0 ;;
+      -*) shift ;;
+      *) printf "%s\n" "$1"; return 0 ;;
+    esac
+  done
+  printf "\n"
+}
+resolve_gh_repo_arg() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -R|--repo)
+        if [ $# -lt 2 ]; then return 1; fi
+        normalize_github_repo_path "$2" && return 0
+        shift 2
+        ;;
+      --repo=*)
+        normalize_github_repo_path "${1#--repo=}" && return 0
+        shift
+        ;;
+      *) shift ;;
+    esac
+  done
+  return 1
+}
+resolve_current_repo_path() {
+  local current_branch=""
+  local branch_remote=""
+  local remote_name=""
+  local remote_url=""
+  current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -n "$current_branch" ]; then
+    branch_remote="$(git config --get "branch.$current_branch.remote" 2>/dev/null || true)"
+  fi
+  for remote_name in "$branch_remote" origin $(git remote 2>/dev/null || true); do
+    [ -n "$remote_name" ] || continue
+    remote_url="$(git config --get "remote.$remote_name.url" 2>/dev/null || true)"
+    [ -n "$remote_url" ] || remote_url="$remote_name"
+    normalize_github_repo_path "$remote_url" && return 0
+  done
+  return 1
+}
+resolve_gh_api_repo_path() {
+  local after_api="0"
+  local api_path=""
+  while [ $# -gt 0 ]; do
+    if [ "$after_api" != "1" ]; then
+      [ "$1" = "api" ] && after_api="1"
+      shift
+      continue
+    fi
+    case "$1" in
+      -X|--method|--hostname|-H|--header|-f|--field|-F|--raw-field|--input|--jq|-q|--preview|--cache)
+        if [ $# -lt 2 ]; then return 1; fi
+        shift 2
+        ;;
+      --method=*|--hostname=*|--header=*|--field=*|--raw-field=*|--input=*|--jq=*|--preview=*|--cache=*) shift ;;
+      --paginate|--silent|--include|--verbose) shift ;;
+      -*) shift ;;
+      *) api_path="$1"; break ;;
+    esac
+  done
+  [ -n "$api_path" ] || return 1
+  normalize_github_repo_path "$api_path"
+}
+gh_api_is_write() {
+  local after_api="0"
+  local method=""
+  local has_body="0"
+  while [ $# -gt 0 ]; do
+    if [ "$after_api" != "1" ]; then
+      [ "$1" = "api" ] && after_api="1"
+      shift
+      continue
+    fi
+    case "$1" in
+      -X|--method)
+        if [ $# -lt 2 ]; then return 1; fi
+        method="$2"
+        shift 2
+        ;;
+      --method=*)
+        method="${1#--method=}"
+        shift
+        ;;
+      -f|--field|-F|--raw-field|--input)
+        has_body="1"
+        if [ $# -lt 2 ]; then return 1; fi
+        shift 2
+        ;;
+      --field=*|--raw-field=*|--input=*)
+        has_body="1"
+        shift
+        ;;
+      *) shift ;;
+    esac
+  done
+  if [ -z "$method" ] && [ "$has_body" = "1" ]; then method="POST"; fi
+  method="$(printf "%s" "$method" | tr "[:lower:]" "[:upper:]")"
+  case "$method" in POST|PUT|PATCH|DELETE) return 0 ;; esac
+  return 1
+}
+resolve_gh_write_action() {
+  local command="$1"
+  local subcommand="$2"
+  case "$command:$subcommand" in
+    pr:create|pr:edit|pr:merge|pr:close|pr:reopen|pr:ready|pr:review|pr:comment)
+      printf "%s\n" "pull request"; return 0 ;;
+    issue:create|issue:edit|issue:close|issue:reopen|issue:comment|issue:delete|issue:lock|issue:pin|issue:transfer)
+      printf "%s\n" "issue"; return 0 ;;
+    release:create|release:edit|release:delete|release:upload|release:delete-asset)
+      printf "%s\n" "release"; return 0 ;;
+    repo:create|repo:edit|repo:delete|repo:fork|repo:sync)
+      printf "%s\n" "repo"; return 0 ;;
+  esac
+  if [ "$command" = "api" ] && gh_api_is_write "$@"; then
+    printf "%s\n" "api write"
+    return 0
+  fi
+  return 1
+}
+resolve_gh_write_repo_path() {
+  local command="$1"
+  local subcommand="$2"
+  shift 2 || true
+  resolve_gh_repo_arg "$@" && return 0
+  if [ "$command" = "api" ]; then resolve_gh_api_repo_path "$@" && return 0; fi
+  if [ "$command" = "repo" ] && [ "$subcommand" = "create" ]; then
+    while [ $# -gt 0 ]; do
+      case "$1" in -*) shift ;; *) normalize_github_repo_path "$1" && return 0; shift ;; esac
+    done
+  fi
+  resolve_current_repo_path
+}
+check_github_actor_gh_write() {
+  if [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" != "1" ] && ! github_actor_write_scope_is_required; then return 0; fi
+  local command=""
+  local subcommand=""
+  local action=""
+  local repo_path=""
+  command="$(resolve_gh_command "$@")"
+  [ -n "$command" ] || return 0
+  subcommand="$(resolve_gh_subcommand "$command" "$@")"
+  action="$(resolve_gh_write_action "$command" "$subcommand" "$@" || true)"
+  [ -n "$action" ] || return 0
+  repo_path="$(resolve_gh_write_repo_path "$command" "$subcommand" "$@" || true)"
+  if github_actor_write_scope_is_required; then
+    github_actor_write_repo_in_scope "$repo_path" || emit_github_actor_write_out_of_scope_signal "$action" "$repo_path"
+  fi
+  [ "$GITHUB_ACTOR_WRITE_CONNECT_REQUIRED" = "1" ] && emit_github_actor_write_connect_signal "$action"
+  if [ "$command" = "pr" ] && [ "$subcommand" = "create" ] && github_actor_write_scope_is_required; then
+    exec_github_actor_pr_create_rest "$repo_path" "$@"
+  fi
+  return 0
+}
+REAL_GH_PATH="$(resolve_real_gh || true)"
+if [ -z "$REAL_GH_PATH" ]; then
+  echo "GitHub CLI guard could not locate the real gh binary." >&2
+  exit 127
+fi
+check_github_actor_gh_write "$@"
+exec "$REAL_GH_PATH" "$@"
