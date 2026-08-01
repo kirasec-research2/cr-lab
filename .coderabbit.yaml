@@ -1,0 +1,5 @@
+reviews:
+  profile: chill
+  tools:
+    eslint:
+      enabled: true
