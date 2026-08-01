@@ -3,10 +3,3 @@ reviews:
   tools:
     eslint:
       enabled: true
-    pylint:
-      enabled: true
-    rubocop:
-      enabled: true
-    phpstan:
-      enabled: true
-      level: '5'
